@@ -238,7 +238,9 @@ impl GpuGuard {
     /// 启动时构造并探测一次；探测结果缓存，之后不再扫文件系统
     pub fn new() -> Self {
         let mut nodes = Vec::new();
-        if std::path::Path::new(ADRENO_DIR).exists() {
+        // [dada] 部分机型（小米 15）kgsl-3d0 下没有 max_freq/min_freq，真正的调频节点在 devfreq 目录，
+        // 这里先探 ADRENO_DIR 只会打出三条无害 WARN，缺 max_freq 就直接跳过
+        if std::path::Path::new(&format!("{ADRENO_DIR}/max_freq")).exists() {
             probe_devfreq(ADRENO_DIR, &mut nodes);
         }
         if let Ok(entries) = fs::read_dir(GPU_DEVFREQ_ROOT) {

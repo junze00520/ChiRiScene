@@ -368,7 +368,11 @@ ask_keep_config() {
     if [ $keep_result -eq 0 ]; then
         ui_print "$MSG_KEEP_CONFIG_YES"
         CONFIG_KEPT=true
-        rm -rf "$MODPATH/config"
+        # [dada] 原逻辑 rm -rf 暂存 config/：KernelSU 用 modules_update 整目录替换模块，config/ 会整个丢失。
+        # 改为把现有配置叠加到暂存目录：新模板补齐新增文件，用户已有文件原样保留
+        if [ -d /data/adb/modules/chiri/config ]; then
+            cp -af /data/adb/modules/chiri/config/. "$MODPATH/config/"
+        fi
     else
         ui_print "$MSG_KEEP_CONFIG_NO"
         CONFIG_KEPT=false
