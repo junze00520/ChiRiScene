@@ -2,7 +2,9 @@
 # 设计：不改上游 build.yml（减少同步上游时的合并冲突），全部 dada 逻辑放这一个文件。
 #  - push 到 dada      → workflow_dispatch 触发上游 build.yml 在 dada 上构建
 #  - 每天 04:17 (CST)  → 合并 upstream/main 进 dada，有更新就触发构建；冲突则开 issue 并失败
-#  - build.yml 成功    → 下载产物、改 versionCode、打 zip、发 Release、刷新 updatepush 分支的 update.json
+#  - 构建成功          → 下载产物、改 versionCode、打 zip、发 Release、刷新 updatepush 分支的 update.json
+#    注意：用 GITHUB_TOKEN 派发的构建不会触发 workflow_run，所以 push/sync 两个 job 派发后原地等构建结束，
+#    再由 release job 通过 needs 接力；workflow_run 只覆盖手动在网页上派发 build.yml 的情况。
 # versionCode = 上游 versionCode * 10000 + dada 提交数（单调递增，上游升版本号也能盖过）
 # 同步上游若涉及 .github/workflows/ 改动，GITHUB_TOKEN 无权推送，需仓库 secret DADA_TOKEN（带 workflow scope）。
 name: "[dada] Automation"
@@ -32,15 +34,34 @@ jobs:
   build-on-push:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      run_id: ${{ steps.b.outputs.run_id }}
     steps:
-      - name: Dispatch build.yml on dada
+      - name: Dispatch build.yml on dada and wait
+        id: b
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run build.yml --ref dada -R "$GITHUB_REPOSITORY"
+        run: |
+          set -euo pipefail
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run build.yml --ref dada -R "$GITHUB_REPOSITORY"
+          ID=""
+          for i in $(seq 1 30); do
+            sleep 10
+            ID=$(gh run list -R "$GITHUB_REPOSITORY" -w build.yml -b dada -e workflow_dispatch --created ">=$SINCE" -L 1 --json databaseId --jq '.[0].databaseId // empty')
+            [ -n "$ID" ] && break
+          done
+          test -n "$ID"
+          echo "run_id=$ID" >> "$GITHUB_OUTPUT"
+          gh run watch "$ID" -R "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null
 
   sync:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      run_id: ${{ steps.b.outputs.run_id }}
     env:
       HAS_PAT: ${{ secrets.DADA_TOKEN != '' }}
     steps:
@@ -75,32 +96,52 @@ jobs:
           fi
           git push origin HEAD:dada
           echo "changed=1" >> "$GITHUB_OUTPUT"
-      # 用 PAT 推送会自然触发 push 事件；用 GITHUB_TOKEN 推送不会，需手动派发
-      - name: Dispatch build
+      # 用 PAT 推送会自然触发 push 事件（由 build-on-push 接手）；用 GITHUB_TOKEN 推送不会，这里自己派发并等待
+      - name: Dispatch build and wait
+        id: b
         if: steps.merge.outputs.changed == '1' && env.HAS_PAT != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run build.yml --ref dada -R "$GITHUB_REPOSITORY"
+        run: |
+          set -euo pipefail
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run build.yml --ref dada -R "$GITHUB_REPOSITORY"
+          ID=""
+          for i in $(seq 1 30); do
+            sleep 10
+            ID=$(gh run list -R "$GITHUB_REPOSITORY" -w build.yml -b dada -e workflow_dispatch --created ">=$SINCE" -L 1 --json databaseId --jq '.[0].databaseId // empty')
+            [ -n "$ID" ] && break
+          done
+          test -n "$ID"
+          echo "run_id=$ID" >> "$GITHUB_OUTPUT"
+          gh run watch "$ID" -R "$GITHUB_REPOSITORY" --exit-status --interval 30 > /dev/null
 
   release:
+    needs: [build-on-push, sync]
     if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'dada' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      always() && (
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.head_branch == 'dada' &&
+         github.event.workflow_run.head_repository.full_name == github.repository) ||
+        (needs.build-on-push.result == 'success' && needs.build-on-push.outputs.run_id != '') ||
+        (needs.sync.result == 'success' && needs.sync.outputs.run_id != ''))
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
-      RUN_ID: ${{ github.event.workflow_run.id }}
-      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      RUN_ID: ${{ github.event.workflow_run.id || needs.build-on-push.outputs.run_id || needs.sync.outputs.run_id }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: dada
           fetch-depth: 0
       - name: Package, release, refresh update.json
         run: |
           set -euo pipefail
+          SHA=$(gh run view "$RUN_ID" -R "$GITHUB_REPOSITORY" --json headSha --jq .headSha)
+          RUN_URL=$(gh run view "$RUN_ID" -R "$GITHUB_REPOSITORY" --json url --jq .url)
+          git checkout -q "$SHA"
           mkdir -p art
           gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -D art
           DIR=$(find art -mindepth 1 -maxdepth 1 -type d | head -n 1)
