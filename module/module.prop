@@ -1,7 +1,7 @@
 id=chiri
 name=ChiRiScene
-version=#5 StarLight 循星指引
+version=#5 StarLight 循星指引 · dada
 versionCode= 50302
-author=Aibeto
-description=ChiRi Schedule 千漓调度 Canary
-updateJson=https://raw.githubusercontent.com/Aibeto/ChiRiScene/updatepush/update.json
+author=Aibeto (dada mod: junze00520)
+description=ChiRi Schedule 千漓调度 Canary · 小米15 (dada) 二改
+updateJson=https://raw.githubusercontent.com/junze00520/ChiRiScene/updatepush/update.json

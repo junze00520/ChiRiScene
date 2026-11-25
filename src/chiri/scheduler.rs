@@ -308,11 +308,15 @@ impl CpuScheduler {
     /// 候选节点逐条尝试写（不预判存在性）：单点失败 debug、全部失败 warn，非 ChiRi 通用内核可能一个节点都没有
     fn apply_disable_touch_boost(&self) -> Result<()> {
         // 路径是字面量，直接用 `(&str, &str)` 数组，省掉逐个 `to_string()` 与 Vec 分配
-        let items: [(&str, &str); 4] = [
+        // [dada] WALT 内核（sm8750 / HyperOS）没有 cpu_boost 模块，触摸升频在 /proc/sys/walt/input_boost/ 下；
+        // 只关普通触摸升频，powerkey/volkey 升频保留（亮屏唤醒响应）
+        let items: [(&str, &str); 6] = [
             ("/sys/module/cpu_boost/parameters/input_boost_enabled", "0"),
             ("/sys/module/cpu_boost/parameters/sched_boost_on_input", "0"),
             ("/sys/module/cpu_boost/parameters/input_boost_ms", "0"),
             ("/sys/module/cpu_boost/parameters/boost_ms", "0"),
+            ("/proc/sys/walt/input_boost/input_boost_ms", "0"),
+            ("/proc/sys/walt/input_boost/sched_boost_on_input", "0"),
         ];
         Self::snapshot_nodes(&items);
         let written = utils::write_nodes(&items, "touch-boost-disable");

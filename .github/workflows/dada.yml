@@ -1,0 +1,134 @@
+# dada.yml: [dada] 小米 15（dada / SM8750）二改分支自动化
+# 设计：不改上游 build.yml（减少同步上游时的合并冲突），全部 dada 逻辑放这一个文件。
+#  - push 到 dada      → workflow_dispatch 触发上游 build.yml 在 dada 上构建
+#  - 每天 04:17 (CST)  → 合并 upstream/main 进 dada，有更新就触发构建；冲突则开 issue 并失败
+#  - build.yml 成功    → 下载产物、改 versionCode、打 zip、发 Release、刷新 updatepush 分支的 update.json
+# versionCode = 上游 versionCode * 10000 + dada 提交数（单调递增，上游升版本号也能盖过）
+# 同步上游若涉及 .github/workflows/ 改动，GITHUB_TOKEN 无权推送，需仓库 secret DADA_TOKEN（带 workflow scope）。
+name: "[dada] Automation"
+
+on:
+  push:
+    branches: ["dada"]
+    paths-ignore:
+      - "docs/**"
+      - "agentsdocs/**"
+      - "mdocs/**"
+      - ".archive/**"
+      - ".dsh/**"
+  schedule:
+    - cron: "17 20 * * *"
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Build ChiRi"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+jobs:
+  build-on-push:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch build.yml on dada
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --ref dada -R "$GITHUB_REPOSITORY"
+
+  sync:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      HAS_PAT: ${{ secrets.DADA_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: dada
+          fetch-depth: 0
+          token: ${{ secrets.DADA_TOKEN || github.token }}
+      - name: Merge upstream/main into dada
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Aibeto/ChiRiScene.git
+          git fetch --no-tags upstream main
+          UP=$(git rev-parse --short upstream/main)
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "dada 已包含 upstream/main $UP"
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git merge --no-edit -m "merge upstream/main $UP" upstream/main; then
+            git diff --name-only --diff-filter=U > conflicts.txt || true
+            git merge --abort || true
+            gh issue create -R "$GITHUB_REPOSITORY" \
+              --title "[dada] 上游合并冲突 upstream/main $UP" \
+              --body "$(printf '自动合并失败，需本地手工合并。\n\n冲突文件：\n%s' "$(sed 's/^/- /' conflicts.txt)")" || true
+            exit 1
+          fi
+          git push origin HEAD:dada
+          echo "changed=1" >> "$GITHUB_OUTPUT"
+      # 用 PAT 推送会自然触发 push 事件；用 GITHUB_TOKEN 推送不会，需手动派发
+      - name: Dispatch build
+        if: steps.merge.outputs.changed == '1' && env.HAS_PAT != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --ref dada -R "$GITHUB_REPOSITORY"
+
+  release:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'dada' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Package, release, refresh update.json
+        run: |
+          set -euo pipefail
+          mkdir -p art
+          gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -D art
+          DIR=$(find art -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          PROP="$DIR/module.prop"
+          test -f "$PROP"
+          BASE=$(grep -E '^versionCode=' module/module.prop | tr -dc '0-9')
+          COUNT=$(git rev-list --count HEAD)
+          CODE=$((BASE * 10000 + COUNT))
+          VER=$(grep -E '^version=' "$PROP" | cut -d= -f2-)
+          sed -i -E "s/^versionCode=.*/versionCode=$CODE/" "$PROP"
+          TAG="dada-$CODE"
+          ZIP="ChiRiScene-dada-$CODE.zip"
+          (cd "$DIR" && zip -qr9 "$GITHUB_WORKSPACE/$ZIP" .)
+          PREV=$(git tag -l 'dada-*' --sort=-v:refname | head -n 1 || true)
+          RANGE=HEAD; [ -n "$PREV" ] && RANGE="$PREV..HEAD"
+          { echo "构建: $RUN_URL"; echo; git log --no-merges -40 --pretty='- %h %s' $RANGE; } > notes.md
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" -y --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "$ZIP" -R "$GITHUB_REPOSITORY" --target "$(git rev-parse HEAD)" \
+            --title "$VER ($CODE)" --notes-file notes.md
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ZIP"
+          RAW="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/updatepush"
+          W=$(mktemp -d)
+          jq -n --arg v "$VER" --argjson c "$CODE" --arg z "$URL" --arg cl "$RAW/changelog.md" \
+            '{version: $v, versionCode: $c, zipUrl: $z, changelog: $cl}' > "$W/update.json"
+          { echo "## $VER ($CODE)"; echo; cat notes.md; } > "$W/changelog.md"
+          cd "$W"
+          git init -q -b updatepush
+          git add update.json changelog.md
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -qm "update.json -> $CODE"
+          git push -f "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" updatepush
+          cat update.json

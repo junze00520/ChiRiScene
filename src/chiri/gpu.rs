@@ -11,14 +11,29 @@ use crate::i18n::{t, t_with_args};
 const GPU_DEVFREQ_ROOT: &str = "/sys/class/devfreq";
 const ADRENO_DIR: &str = "/sys/class/kgsl/kgsl-3d0";
 const ADRENO_MAX_CLK: &str = "/sys/class/kgsl/kgsl-3d0/max_gpu_clk";
+/// [dada] 新 kgsl 驱动节点名是 max_gpuclk（无下划线），频点表在 gpu_available_frequencies
+const ADRENO_MAX_CLK_ALT: &str = "/sys/class/kgsl/kgsl-3d0/max_gpuclk";
 
 fn read_u32(path: &str) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// [dada] Adreno 硬件上限：旧驱动 max_gpu_clk，新驱动 max_gpuclk
+fn read_adreno_max_clk() -> Option<u32> {
+    read_u32(ADRENO_MAX_CLK).or_else(|| read_u32(ADRENO_MAX_CLK_ALT))
+}
+
+/// [dada] devfreq 设备名是否为 GPU 本体；kgsl-busmon 是 GPU 总线带宽监视器（gpubw_mon），
+/// 名字含 kgsl 但不是 GPU 频率，锁它到最高档只会白白拉高 DDR 带宽功耗
+fn is_gpu_devfreq(name: &str) -> bool {
+    let gpu = name.contains("gpu") || name.contains("kgsl") || name.contains("mali");
+    gpu && !name.contains("busmon")
+}
+
 fn read_freq_range(dir: &str) -> Option<(u32, u32)> {
     // available_frequencies 是唯一可信来源：max 是硬件上限、min 是硬件最低频（release 残留防护的兜底恢复值）；devfreq 的 max_freq/min_freq 只是当前限值
     let mut freqs: Vec<u32> = fs::read_to_string(format!("{dir}/available_frequencies"))
+        .or_else(|_| fs::read_to_string(format!("{dir}/gpu_available_frequencies")))
         .ok()?
         .split_whitespace()
         .filter_map(|s| s.parse().ok())
@@ -49,7 +64,7 @@ fn probe_devfreq(dir: &str, out: &mut Vec<GpuNode>) {
     // available_frequencies 缺失时，Adreno 用 max_gpu_clk 兜底硬件上限
     let (hw_min, hw_max) = match read_freq_range(dir) {
         Some(r) => r,
-        None if dir.contains("kgsl") => match read_u32(ADRENO_MAX_CLK) {
+        None if dir.contains("kgsl") => match read_adreno_max_clk() {
             Some(hw_max) => (
                 read_u32(&format!("{dir}/min_freq")).unwrap_or(hw_max),
                 hw_max,
@@ -134,7 +149,7 @@ pub fn devfreq_snapshot() -> (String, String, String, String) {
     if let Ok(entries) = fs::read_dir(GPU_DEVFREQ_ROOT) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_lowercase();
-            if name.contains("gpu") || name.contains("kgsl") || name.contains("mali") {
+            if is_gpu_devfreq(&name) {
                 let dir = entry.path().to_string_lossy().to_string();
                 seen.push(name);
                 dirs.push((dir, true));
@@ -230,7 +245,7 @@ impl GpuGuard {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_lowercase();
                 let dir = entry.path().to_string_lossy().to_string();
-                if name.contains("gpu") || name.contains("kgsl") || name.contains("mali") {
+                if is_gpu_devfreq(&name) {
                     probe_devfreq(&dir, &mut nodes);
                 }
             }
