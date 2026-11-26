@@ -702,6 +702,13 @@ fn fmt_num(v: Option<f32>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| NA.to_string())
 }
 
+/// [dada] status.csv 落盘节流计数：每次 status_log_snapshot 调用 +1（调用方 1s 一次）
+static STATUS_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// [dada] 亮屏每 2 次调用落一行（2s）
+const STATUS_EVERY_ON: u64 = 2;
+/// [dada] 息屏每 10 次调用落一行（10s）：息屏状态变化慢，1s 粒度只是徒增闪存写入
+const STATUS_EVERY_OFF: u64 = 10;
+
 /// 写 snapshot 行（1s 一条，chiri 调度线程）：遥测 + 热保护 + 模式状态 + 前台包名 + 充放电状态 + FAS 帧率 + `screen_prop`（debug.tracing.screen_state 原始值）
 #[allow(clippy::too_many_arguments)]
 pub fn status_log_snapshot(
@@ -734,6 +741,16 @@ pub fn status_log_snapshot(
 ) {
     // frozen（待春归）：status.csv 属于该模式要停的「额外开销」；闸口集中在此，所有写入路径过同一道
     if mode == "frozen" {
+        return;
+    }
+    // [dada] 节流：亮屏 2s、息屏 10s 一行；PowerAVG 在独立函数里更新，不受影响
+    let tick = STATUS_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let every = if screen_on {
+        STATUS_EVERY_ON
+    } else {
+        STATUS_EVERY_OFF
+    };
+    if !tick.is_multiple_of(every) {
         return;
     }
     status_write_line(&[

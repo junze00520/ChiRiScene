@@ -2901,9 +2901,9 @@ impl AffinityManager {
                 (Ok(()), Some(got)) => dst_mask.iter().any(|c| !got.contains(c)),
                 _ => false,
             };
-            // INFO：只写线程 + 方向（用户口径）
+            // [dada] 线程迁移逐条日志降为 DEBUG（实测一夜 4764 行，占 daemon.log 大头）
             if res.is_ok() && !clipped {
-                info!(
+                debug!(
                     "{}",
                     t_with_args(
                         "affinity-migrate",

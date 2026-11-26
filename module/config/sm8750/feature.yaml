@@ -19,7 +19,8 @@ IO_Settings:
 CpuIdle:
   current_governor: "menu"
 
-scene_mode_delay_secs: 3000
+# [dada] 息屏 5 分钟即进 scenemode（上游 3000s=50 分钟，实测一夜 109 次息屏仅 3 次进入）
+scene_mode_delay_secs: 300
 
 # [affinity]
 Affinity:
