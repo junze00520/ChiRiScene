@@ -2300,6 +2300,8 @@ fn fas_affinity_hook(
 ) {
     let _ = (corectl_mgr, fg_pid);
     affinity_mgr.set_boost_uclamp_override(active);
+    // [dada] 游戏关键线程绑 prime（激活）/ 还原（退出）
+    affinity_mgr.set_fas_prime_keys(active);
 }
 
 // [mode_file]

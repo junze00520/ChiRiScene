@@ -29,6 +29,10 @@ const SYMBOL_SHORT: &str = "_ZN7android7Surface11queueBufferEP19ANativeWindowBuf
 /// uprobe 符号名（长签名，fallback）
 const SYMBOL_LONG: &str =
     "_ZN7android7Surface11queueBufferEP19ANativeWindowBufferiPNS_24SurfaceQueueBufferOutputE";
+/// [dada] Android 17 libgui 已删除 `Surface::queueBuffer(ANativeWindowBuffer*, int)`（逻辑内联进 hook_queueBuffer），
+/// 前缀扫描只会命中新的 GraphicBuffer 重载（Vulkan/EGL 不走，attach 成功但 0 帧）；ANativeWindow 入口 hook_queueBuffer 各版本都在
+const SYMBOL_HOOK: &str =
+    "_ZN7android7Surface16hook_queueBufferEP13ANativeWindowP19ANativeWindowBufferi";
 const LIBGUI_PATH: &str = "/system/lib64/libgui.so";
 
 /// `android::Surface::queueBuffer` 的 mangled 前缀：类名/方法名固定，参数签名随 Android 版本变化，硬编码短/长名在新机型都可能解析失败（FAS 收不到帧、档位不动）
@@ -460,7 +464,11 @@ impl FpsManager {
 
         // 候选顺序：短签名 → 长签名 → dynsym 扫描变体，覆盖短/长名都解析失败的机型，按 mangled 前缀匹配
         // TODO: 两个签名并存时先试短签名，若真机帧数偏少说明挂到非主路径重载，改长签名优先再验
-        let mut candidates: Vec<String> = vec![SYMBOL_SHORT.to_string(), SYMBOL_LONG.to_string()];
+        let mut candidates: Vec<String> = vec![
+            SYMBOL_SHORT.to_string(),
+            SYMBOL_LONG.to_string(),
+            SYMBOL_HOOK.to_string(),
+        ];
         for sym in &self.symbol_candidates {
             if !candidates.contains(sym) {
                 candidates.push(sym.clone());

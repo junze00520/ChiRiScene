@@ -859,6 +859,10 @@ struct ThreadState {
 /// 掩码写入目标 tag：区分单核钉定（tag = core 号）与两种组掩码，供同目标去重判断
 const MASK_TAG_PERF: u64 = u64::MAX - 1;
 const MASK_TAG_FULL: u64 = u64::MAX;
+/// [dada] FAS 关键线程 prime 绑定的掩码 tag（与 PERF/FULL/单核号区分）
+const MASK_TAG_PRIME: u64 = u64::MAX - 2;
+/// [dada] prime 绑定再断言间隔：Unity 等引擎会自设线程亲和（实测 f0），定期收敛回 prime
+const FAS_PRIME_REASSERT: Duration = Duration::from_secs(10);
 
 /// 「持续忙」两窗判定（前台 normal_busy 与后台 promote 共用）：util≥busy_pct 记忙窗并返回是否连续两窗忙；util<release_pct 清忙标记，滞回带保持上次值
 /// 不依赖采样间隔（分片下同线程两次被采到可能相隔很久）；只维护 last_busy，其余状态由调用方处理
@@ -902,6 +906,8 @@ pub struct AffinityManager {
     fg_cmdline: String,
     /// default little 高水位迟滞锁存：>HIGH_WATER 激活、<RELEASE_WATER 解除，防乒乓
     key_bind_active: bool,
+    /// [dada] FAS 激活期：按线程名识别的游戏关键线程（不含主线程）绑到 prime 簇
+    fas_prime_keys: bool,
     /// normal_busy 采样轮转游标：压力窗口内每轮只扫 FG_SCAN_WINDOW 个
     fg_cursor: usize,
     /// boost 期 top-app uclamp.max 放开（写 100）前的值快照（None = 未接管）：机型值85 真机走 waltgov 限频钳制不进能量模型，对 FAS/akmode 只有负效应，
@@ -977,6 +983,7 @@ impl AffinityManager {
             self_pid: std::process::id(),
             fg_cmdline: String::new(),
             key_bind_active: false,
+            fas_prime_keys: false,
             fg_cursor: 0,
             boost_uclamp_prev: None,
             lab_static_mode: None,
@@ -1623,6 +1630,68 @@ impl AffinityManager {
         logged_write(&format!("/dev/cpuset/{group}/tasks"), &tid.to_string())
     }
 
+    /// [dada] FAS 激活开关（fas_affinity_hook 调用）
+    pub fn set_fas_prime_keys(&mut self, on: bool) {
+        self.fas_prime_keys = on;
+    }
+
+    /// [dada] FAS 关键线程 prime 绑定：返回 true = 本轮已处理该线程（已绑定 / 刚写入 / 刚还原），调用方跳过常规关键线程路径
+    /// 仅按线程名命中（UnityMain / UnityGfxDeviceW / RenderThread 等），主线程留在性能核组；FAS 退出或离开 boost 即还原全核
+    fn fas_prime_step(
+        &mut self,
+        tid: i32,
+        fg_pid: i32,
+        pkg: &str,
+        prime_pool: &[usize],
+        pin_fg: bool,
+    ) -> bool {
+        let now = Instant::now();
+        let Some(st) = self.threads.get(&tid) else {
+            return false;
+        };
+        let bound = st.group_bind != GroupBind::None;
+        let last_prime = match st.last_mask_write {
+            Some((MASK_TAG_PRIME, at)) if bound => Some(at),
+            _ => None,
+        };
+        let by_name = KEY_THREAD_COMMS.iter().any(|k| *k == st.comm);
+        if !(pin_fg && self.fas_prime_keys && by_name) || prime_pool.is_empty() {
+            if last_prime.is_some() {
+                let _ = self.restore_group_mask(tid, fg_pid, pkg);
+                return true;
+            }
+            return false;
+        }
+        if last_prime.is_some_and(|at| now.duration_since(at) < FAS_PRIME_REASSERT) {
+            return true;
+        }
+        if !self.mask_write_allowed(tid, prime_pool) {
+            return false;
+        }
+        let res = set_tid_affinity(tid, prime_pool);
+        if crate::logger::diag_active() {
+            let comm = self.thread_comm(tid);
+            crate::logger::aff_action(
+                "pin",
+                fg_pid,
+                tid,
+                pkg,
+                comm,
+                "prime",
+                "-",
+                &io_result_tag(&res),
+                "fas_prime",
+            );
+        }
+        if res.is_ok() {
+            if let Some(st) = self.threads.get_mut(&tid) {
+                st.group_bind = GroupBind::Key;
+            }
+            self.record_mask_write(tid, MASK_TAG_PRIME, now);
+        }
+        true
+    }
+
     /// 关键线程组掩码兜底还原：恢复全核掩码并清 group_bind，不触碰单核钉定计数；失败不置 group_bind（下次重试），仅补 @A 帧未做组绑定时为无操作
     fn restore_group_mask(&mut self, tid: i32, pid: i32, pkg: &str) -> std::io::Result<()> {
         let pinned = self
@@ -1944,7 +2013,9 @@ impl AffinityManager {
                             {
                                 scan_pool.push(tid);
                             }
-                            if pin_fg {
+                            if self.fas_prime_step(tid, fg_pid, &pkg, &prime_pool, pin_fg) {
+                                // [dada] FAS 关键线程已由 prime 绑定接管（或刚还原）
+                            } else if pin_fg {
                                 if is_key {
                                     // 关键线程核组绑定（AppOptR 式）：不钉单核，boost 下cpuset 已收窄 prime∪big 组内自调度；
                                     // cpuset 不可用时写一次组掩码兜底（短路去重，不占钉核计数）
